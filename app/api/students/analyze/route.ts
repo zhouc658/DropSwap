@@ -113,7 +113,7 @@ provided experience and project needs.
       responseFormat: {
         type: "json_object",
 
-        schema: {
+        jsonSchema: {
           type: "object",
 
           properties: {
