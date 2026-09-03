@@ -4,7 +4,8 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
+  schemas  = ["matching"]
 }
 
 model Student {
@@ -29,4 +30,24 @@ model Student {
 
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+
+  sentInterests     Interest[] @relation("SentInterests")
+  receivedInterests Interest[] @relation("ReceivedInterests")
+
+  @@schema("matching")
+}
+
+model Interest {
+  id         Int      @id @default(autoincrement())
+  senderId   Int
+  receiverId Int
+  status     String   @default("interested")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  sender   Student @relation("SentInterests", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver Student @relation("ReceivedInterests", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@unique([senderId, receiverId])
+  @@schema("matching")
 }

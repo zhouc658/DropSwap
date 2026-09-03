@@ -115,6 +115,20 @@ function calculateMotivationScore(
   return 60;
 }
 
+function findMatchingSkills(
+  neededSkills: string[],
+  availableSkills: Skill[]
+): string[] {
+  return neededSkills.filter((needed) =>
+    availableSkills.some((skill) => {
+      const need = normalize(needed);
+      const has = normalize(skill.name);
+
+      return need.includes(has) || has.includes(need);
+    })
+  );
+}
+
 export async function GET(
   request: Request,
   context: {
@@ -183,15 +197,11 @@ export async function GET(
       []
     );
 
-    /*
-      VERY LIGHT FILTERING
-
-      For the prototype, don't aggressively remove candidates yet.
-      We want to see how Cohere ranks everyone.
-
-      We only remove extreme availability mismatches.
-    */
-
+    /**
+     * VERY LIGHT FILTERING
+     *
+     * Only remove extreme availability mismatches.
+     */
     const candidates = allCandidates.filter(
       (candidate) => {
         if (
@@ -219,12 +229,9 @@ export async function GET(
       });
     }
 
-    /*
-      This describes WHAT THE CURRENT STUDENT NEEDS.
-
-      Cohere will compare every candidate against this query.
-    */
-
+    /**
+     * Cohere should focus mainly on complementary skills.
+     */
     const query = `
 Find the best collaboration partner for this student.
 
@@ -235,12 +242,14 @@ Creator type:
 ${student.creatorType || "Unknown"}
 
 Skills they already have:
-${studentSkills
-  .map(
-    (skill) =>
-      `${skill.name} (${skill.level})`
-  )
-  .join(", ") || "Unknown"}
+${
+  studentSkills
+    .map(
+      (skill) =>
+        `${skill.name} (${skill.level})`
+    )
+    .join(", ") || "Unknown"
+}
 
 Skills they need:
 ${studentNeededSkills.join(", ") || "Unknown"}
@@ -268,17 +277,22 @@ A strong candidate should:
 
 1. Have skills that directly fill this student's missing skills.
 2. Ideally need skills that this student already has.
-3. Have compatible availability.
-4. Have compatible motivation.
-5. Have a compatible collaboration role.
+3. Prioritize complementary skills over similar backgrounds.
 
-Prioritize reciprocal skill exchange rather than simple similarity.
+IMPORTANT:
+
+Rank candidates mainly based on SKILL COMPLEMENTARITY.
+
+Do not prioritize availability, motivation, or role preference in this ranking.
+Those factors will be scored separately by DropSwap.
+
+The strongest match is someone who has skills the student needs,
+especially when the student also has skills that the candidate needs.
 `;
 
-    /*
-      Turn every candidate into one searchable document.
-    */
-
+    /**
+     * Turn each candidate into a document for Cohere.
+     */
     const documents = candidates.map(
       (candidate) => {
         const skills = safeParse<Skill[]>(
@@ -304,12 +318,14 @@ CREATOR TYPE:
 ${candidate.creatorType || "Unknown"}
 
 HAS THESE SKILLS:
-${skills
-  .map(
-    (skill) =>
-      `${skill.name} (${skill.level})`
-  )
-  .join(", ") || "Unknown"}
+${
+  skills
+    .map(
+      (skill) =>
+        `${skill.name} (${skill.level})`
+    )
+    .join(", ") || "Unknown"
+}
 
 NEEDS THESE SKILLS:
 ${neededSkills.join(", ") || "Unknown"}
@@ -336,10 +352,9 @@ ${candidate.rolePreference || "Unknown"}
       }
     );
 
-    /*
-      Ask Cohere to rank the candidates.
-    */
-
+    /**
+     * Ask Cohere to rank candidates.
+     */
     const rerank = await cohere.rerank({
       model: "rerank-v3.5",
       query,
@@ -347,10 +362,9 @@ ${candidate.rolePreference || "Unknown"}
       topN: Math.min(5, candidates.length),
     });
 
-    /*
-      Convert Cohere's ranking back into real students.
-    */
-
+    /**
+     * Convert Cohere ranking back into student objects.
+     */
     const matches = rerank.results.map(
       (result) => {
         const candidate =
@@ -374,40 +388,141 @@ ${candidate.rolePreference || "Unknown"}
             candidate.motivation
           );
 
-        /*
-          Cohere score is 0-1.
-          Convert it to a 0-100 signal.
-
-          This is NOT displayed directly as
-          "Cohere says you're 93% compatible."
-        */
-
+        /**
+         * Cohere relevance score converted from 0-1 to 0-100.
+         */
         const skillFitScore =
           result.relevanceScore * 100;
 
-        /*
-          Our first experimental DropSwap score.
-
-          Skill/gap fit is intentionally weighted highest.
-        */
-
-        const compatibilityScore = Math.round(
-          skillFitScore * 0.55 +
-            availabilityScore * 0.2 +
-            roleScore * 0.15 +
-            motivationScore * 0.1
-        );
-
-        const skills = safeParse<Skill[]>(
+        const candidateSkills = safeParse<Skill[]>(
           candidate.skills,
           []
         );
 
-        const neededSkills =
+        const candidateNeededSkills =
           safeParse<string[]>(
             candidate.neededSkills,
             []
           );
+
+        /**
+         * Direct reciprocal skill matching.
+         */
+        const youNeedTheyHave =
+          findMatchingSkills(
+            studentNeededSkills,
+            candidateSkills
+          );
+
+        const theyNeedYouHave =
+          findMatchingSkills(
+            candidateNeededSkills,
+            studentSkills
+          );
+
+        /**
+         * What percentage of your needed skills
+         * does this person directly cover?
+         */
+        const yourNeedsCovered =
+          studentNeededSkills.length > 0
+            ? youNeedTheyHave.length /
+              studentNeededSkills.length
+            : 0;
+
+        /**
+         * What percentage of their needed skills
+         * do you directly cover?
+         */
+        const theirNeedsCovered =
+          candidateNeededSkills.length > 0
+            ? theyNeedYouHave.length /
+              candidateNeededSkills.length
+            : 0;
+
+        /**
+         * Reciprocal skill score.
+         *
+         * Your needs = 70%
+         * Their needs = 30%
+         */
+        const reciprocalSkillScore = Math.round(
+          (yourNeedsCovered * 0.7 +
+            theirNeedsCovered * 0.3) *
+            100
+        );
+
+        /**
+         * FINAL DROPSWAP SCORE
+         *
+         * Direct skill match matters the most.
+         */
+        const compatibilityScore = Math.round(
+          reciprocalSkillScore * 0.5 +
+            skillFitScore * 0.2 +
+            availabilityScore * 0.1 +
+            roleScore * 0.1 +
+            motivationScore * 0.1
+        );
+
+        /**
+         * Human-readable reasons.
+         */
+        const matchReasons: string[] = [];
+
+        if (youNeedTheyHave.length > 0) {
+          matchReasons.push(
+            `They have skills you need: ${youNeedTheyHave.join(
+              ", "
+            )}`
+          );
+        }
+
+        if (theyNeedYouHave.length > 0) {
+          matchReasons.push(
+            `You have skills they need: ${theyNeedYouHave.join(
+              ", "
+            )}`
+          );
+        }
+
+        if (
+          student.availability !== null &&
+          candidate.availability !== null
+        ) {
+          const difference = Math.abs(
+            student.availability -
+              candidate.availability
+          );
+
+          if (difference <= 3) {
+            matchReasons.push(
+              "You have similar weekly availability"
+            );
+          }
+        }
+
+        if (
+          student.motivation &&
+          candidate.motivation &&
+          normalize(student.motivation) ===
+            normalize(candidate.motivation)
+        ) {
+          matchReasons.push(
+            `You share a similar motivation: ${candidate.motivation}`
+          );
+        }
+
+        if (
+          student.rolePreference &&
+          candidate.rolePreference &&
+          normalize(student.rolePreference) !==
+            normalize(candidate.rolePreference)
+        ) {
+          matchReasons.push(
+            "Your preferred working roles complement each other"
+          );
+        }
 
         return {
           id: candidate.id,
@@ -417,8 +532,9 @@ ${candidate.rolePreference || "Unknown"}
           creatorType:
             candidate.creatorType,
 
-          skills,
-          neededSkills,
+          skills: candidateSkills,
+          neededSkills:
+            candidateNeededSkills,
 
           availability:
             candidate.availability,
@@ -432,6 +548,9 @@ ${candidate.rolePreference || "Unknown"}
           compatibilityScore,
 
           scores: {
+            reciprocalSkillFit:
+              reciprocalSkillScore,
+
             semanticSkillFit:
               Math.round(skillFitScore),
 
@@ -445,17 +564,19 @@ ${candidate.rolePreference || "Unknown"}
               motivationScore,
           },
 
+          matchReasons,
+          youNeedTheyHave,
+          theyNeedYouHave,
+
           rerankScore:
             result.relevanceScore,
         };
       }
     );
 
-    /*
-      Our combined score can change the ordering slightly,
-      so sort again.
-    */
-
+    /**
+     * Sort by final DropSwap compatibility score.
+     */
     matches.sort(
       (a, b) =>
         b.compatibilityScore -
